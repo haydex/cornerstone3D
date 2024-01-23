@@ -59,7 +59,7 @@ async function run() {
    *
    * Copy-paste the code from tutorials below to try them locally.
    * You can run the tutorial after by running `yarn run example tutorial` when
-   * you are at the root of the tools package directory. HAYDEX SuCCESS!!
+   * you are at the root of the tools package directory. HAYDEX Success!!
    *
    *
    *
