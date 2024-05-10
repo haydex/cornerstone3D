@@ -53,13 +53,13 @@
     "@babel/plugin-external-helpers": "^7.18.6",
     "@babel/plugin-proposal-class-properties": "^7.18.6",
     "@babel/plugin-proposal-object-rest-spread": "^7.14.7",
+    "@babel/plugin-transform-class-static-block": "^7.16.0",
     "@babel/plugin-transform-runtime": "^7.21.4",
     "@babel/preset-env": "^7.21.5",
     "@babel/preset-react": "^7.18.6",
     "@babel/preset-typescript": "^7.21.5",
     "@babel/runtime": "7.21.5",
     "@babel/runtime-corejs3": "^7.15.4",
-    "@babel/plugin-transform-class-static-block": "^7.16.0",
     "@cornerstonejs/calculate-suv": "1.0.3",
     "@microsoft/api-extractor": "7.38.0",
     "@rollup/plugin-babel": "^6.0.3",
@@ -168,6 +168,10 @@
     "not ie < 11",
     "not op_mini all"
   ],
-  "dependencies": {},
-  "resolutions": {}
+  "resolutions": {},
+  "dependencies": {
+    "@cornerstonejs/streaming-image-volume-loader": "^1.46.0",
+    "cornerstone-file-image-loader": "^0.3.0",
+    "dicom-parser": "^1.8.21"
+  }
 }
