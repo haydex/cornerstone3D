@@ -1,8 +1,4 @@
-import {
-  getEnabledElementByIds,
-  Types,
-  StackViewport,
-} from '@cornerstonejs/core';
+import { getEnabledElementByIds, Types } from '@cornerstonejs/core';
 
 import Representations from '../../../enums/SegmentationRepresentations';
 import * as SegmentationState from '../../../stateManagement/segmentation/segmentationState';
@@ -11,9 +7,12 @@ import {
   SegmentationRepresentationConfig,
   ToolGroupSpecificRepresentation,
 } from '../../../types/SegmentationStateTypes';
-import { addOrUpdateContourSets } from './addOrUpdateContourSets';
 import removeContourFromElement from './removeContourFromElement';
-import { deleteConfigCache } from './contourConfigCache';
+import { deleteConfigCache } from './contourHandler/contourConfigCache';
+import { polySeg } from '../../../stateManagement/segmentation';
+import { handleContourSegmentation } from './contourHandler/handleContourSegmentation';
+
+let polySegConversionInProgress = false;
 
 /**
  * It removes a segmentation representation from the tool group's viewports and
@@ -66,29 +65,45 @@ async function render(
 ): Promise<void> {
   const { segmentationId } = representationConfig;
   const segmentation = SegmentationState.getSegmentation(segmentationId);
-  const contourData = segmentation.representationData[Representations.Contour];
-  const { geometryIds } = contourData;
 
-  // We don't have a good way to handle stack viewports for contours at the moment.
-  // Plus, if we add a segmentation to one viewport, it gets added to all the viewports in the toolGroup too.
-  if (viewport instanceof StackViewport) {
+  if (!segmentation) {
     return;
   }
 
-  if (!geometryIds?.length) {
-    console.warn(
-      `No contours found for segmentationId ${segmentationId}. Skipping render.`
+  let contourData = segmentation.representationData[Representations.Contour];
+
+  if (
+    !contourData &&
+    polySeg.canComputeRequestedRepresentation(
+      representationConfig.segmentationRepresentationUID
+    ) &&
+    !polySegConversionInProgress
+  ) {
+    polySegConversionInProgress = true;
+
+    contourData = await polySeg.computeAndAddContourRepresentation(
+      segmentationId,
+      {
+        segmentationRepresentationUID:
+          representationConfig.segmentationRepresentationUID,
+        viewport,
+      }
     );
+  }
+
+  if (!contourData) {
     return;
   }
 
-  // add the contour sets to the viewport
-  addOrUpdateContourSets(
-    viewport,
-    geometryIds,
-    representationConfig,
-    toolGroupConfig
-  );
+  if (contourData?.geometryIds?.length) {
+    handleContourSegmentation(
+      viewport,
+      contourData.geometryIds,
+      contourData.annotationUIDsMap,
+      representationConfig,
+      toolGroupConfig
+    );
+  }
 }
 
 function _removeContourFromToolGroupViewports(
@@ -109,10 +124,7 @@ function _removeContourFromToolGroupViewports(
       viewportId,
       renderingEngineId
     );
-    removeContourFromElement(
-      enabledElement.viewport.element,
-      segmentationRepresentationUID
-    );
+    removeContourFromElement(segmentationRepresentationUID, toolGroupId);
   }
 }
 

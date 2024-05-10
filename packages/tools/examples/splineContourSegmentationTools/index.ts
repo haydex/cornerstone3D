@@ -10,6 +10,7 @@ import {
   initDemo,
   setTitleAndDescription,
   addManipulationBindings,
+  contourSegmentationToolBindings,
 } from '../../../../utils/demo/helpers';
 import type { Types as cstTypes } from '@cornerstonejs/tools';
 
@@ -29,13 +30,15 @@ const DEFAULT_SEGMENTATION_CONFIG = {
   outlineDashInactive: undefined,
 };
 
+const { KeyboardBindings } = cornerstoneTools.Enums;
+
 const {
   SplineContourSegmentationTool,
   SegmentationDisplayTool,
+  PlanarFreehandContourSegmentationTool,
   ToolGroupManager,
   Enums: csToolsEnums,
   segmentation,
-  TrackballRotateTool,
 } = cornerstoneTools;
 const { MouseBindings } = csToolsEnums;
 const { ViewportType } = Enums;
@@ -208,11 +211,7 @@ addDropdownToToolbar({
 
     // Set the new tool active
     toolGroup.setToolActive(newSelectedToolName, {
-      bindings: [
-        {
-          mouseButton: MouseBindings.Primary, // Left Click
-        },
-      ],
+      bindings: contourSegmentationToolBindings,
     });
 
     selectedToolName = <string>newSelectedToolName;
@@ -317,7 +316,7 @@ async function run() {
   // Add tools to Cornerstone3D
   cornerstoneTools.addTool(SegmentationDisplayTool);
   cornerstoneTools.addTool(SplineContourSegmentationTool);
-  cornerstoneTools.addTool(TrackballRotateTool);
+  cornerstoneTools.addTool(PlanarFreehandContourSegmentationTool);
 
   // Define tool groups to add the segmentation display tool to
   const toolGroup = ToolGroupManager.createToolGroup(toolGroupId);
@@ -325,6 +324,7 @@ async function run() {
 
   toolGroup.addTool(SegmentationDisplayTool.toolName);
   toolGroup.addTool(SplineContourSegmentationTool.toolName);
+  toolGroup.addTool(PlanarFreehandContourSegmentationTool.toolName);
 
   toolGroup.addToolInstance(
     'CatmullRomSplineROI',
@@ -359,11 +359,12 @@ async function run() {
   toolGroup.setToolEnabled(SegmentationDisplayTool.toolName);
 
   toolGroup.setToolActive(splineToolsNames[0], {
-    bindings: [
-      {
-        mouseButton: MouseBindings.Primary, // Left Click
-      },
-    ],
+    bindings: contourSegmentationToolBindings,
+  });
+
+  // Spline curves may be converted into freehand contours when they overlaps (append/remove)
+  toolGroup.setToolPassive(PlanarFreehandContourSegmentationTool.toolName, {
+    removeAllBindings: contourSegmentationToolBindings,
   });
 
   // Get Cornerstone imageIds for the source data and fetch metadata into RAM

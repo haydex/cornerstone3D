@@ -121,6 +121,8 @@ function createImage(
   const imageFrame = getImageFrame(imageId);
   imageFrame.decodeLevel = options.decodeLevel;
 
+  options.allowFloatRendering = cornerstone.canRenderFloatTextures();
+
   // Get the scaling parameters from the metadata
   if (options.preScale.enabled) {
     const scalingParameters = getScalingParameters(
@@ -144,6 +146,16 @@ function createImage(
     options.targetBuffer.arrayBuffer instanceof SharedArrayBuffer;
 
   const { decodeConfig } = getOptions();
+
+  // check if the options to use the 16 bit data type is set
+  // on the image load options, and prefer that over the global
+  // options of the dicom loader
+  decodeConfig.use16BitDataType =
+    (options && options.targetBuffer?.type === 'Uint16Array') ||
+    options.targetBuffer?.type === 'Int16Array'
+      ? true
+      : options.useNativeDataType || decodeConfig.use16BitDataType;
+
   const decodePromise = decodeImageFrame(
     imageFrame,
     transferSyntax,
@@ -238,11 +250,20 @@ function createImage(
           canvas.height = imageFrame.rows;
           canvas.width = imageFrame.columns;
           const context = canvas.getContext('2d');
-          const imageData = context.createImageData(
+          let imageData = context.createImageData(
             imageFrame.columns,
             imageFrame.rows
           );
-
+          if (!useRGBA) {
+            imageData = {
+              ...imageData,
+              data: new Uint8ClampedArray(
+                imageFrame.samplesPerPixel *
+                  imageFrame.columns *
+                  imageFrame.rows
+              ),
+            };
+          }
           convertColorSpace(imageFrame, imageData.data, useRGBA);
           imageFrame.imageData = imageData;
           imageFrame.pixelData = imageData.data;

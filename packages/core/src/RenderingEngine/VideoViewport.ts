@@ -1,10 +1,10 @@
 import { vec3 } from 'gl-matrix';
 import {
   Events as EVENTS,
-  VideoViewport as VideoViewportEnum,
+  VideoEnums as VideoViewportEnum,
   MetadataModules,
 } from '../enums';
-import {
+import type {
   IVideoViewport,
   VideoViewportProperties,
   Point3,
@@ -13,12 +13,27 @@ import {
   InternalVideoCamera,
   VideoViewportInput,
   VOIRange,
+  ICanvasActor,
+  IImage,
+  ViewReferenceSpecifier,
+  ViewReference,
+  ReferenceCompatibleOptions,
 } from '../types';
 import * as metaData from '../metaData';
 import { Transform } from './helpers/cpuFallback/rendering/transform';
 import { triggerEvent } from '../utilities';
 import Viewport from './Viewport';
 import { getOrCreateCanvas } from './helpers';
+import CanvasActor from './CanvasActor';
+import cache from '../cache';
+
+/**
+ * A data type for the scalar data for video data.
+ */
+export type CanvasScalarData = Uint8ClampedArray & {
+  frameNumber?: number;
+  getRange?: () => [number, number];
+};
 
 /**
  * An object representing a single stack viewport, which is a camera
@@ -42,6 +57,15 @@ class VideoViewport extends Viewport implements IVideoViewport {
   private isPlaying = false;
   private scrollSpeed = 1;
   private playbackRate = 1;
+  private scalarData: CanvasScalarData;
+
+  /**
+   * This is used to pause initially so that we get at least one render to allow
+   * navigating frames.  Otherwise the viewport is blank initially until the user
+   * hits play manually.
+   */
+  private initialRender: () => void;
+
   /**
    * The range is the set of frames to play
    */
@@ -102,6 +126,7 @@ class VideoViewport extends Viewport implements IVideoViewport {
     this.videoElement = document.createElement('video');
     this.videoElement.muted = this.mute;
     this.videoElement.loop = this.loop;
+    this.videoElement.autoplay = true;
     this.videoElement.crossOrigin = 'anonymous';
 
     this.addEventListeners();
@@ -131,11 +156,9 @@ class VideoViewport extends Viewport implements IVideoViewport {
     this.videoElement.remove();
   }
 
-  private _getImageDataMetadata() {
-    const imagePlaneModule = metaData.get(
-      MetadataModules.IMAGE_PLANE,
-      this.imageId
-    );
+  public getImageDataMetadata(image: IImage | string) {
+    const imageId = typeof image === 'string' ? image : image.imageId;
+    const imagePlaneModule = metaData.get(MetadataModules.IMAGE_PLANE, imageId);
 
     let rowCosines = <Point3>imagePlaneModule.rowCosines;
     let columnCosines = <Point3>imagePlaneModule.columnCosines;
@@ -158,8 +181,6 @@ class VideoViewport extends Viewport implements IVideoViewport {
     );
 
     const { rows, columns } = imagePlaneModule;
-    this.videoWidth = columns;
-    this.videoHeight = rows;
     const scanAxisNormal = vec3.create();
     vec3.cross(scanAxisNormal, rowCosineVec, colCosineVec);
 
@@ -182,6 +203,8 @@ class VideoViewport extends Viewport implements IVideoViewport {
       bitsAllocated: 8,
       numComps: 3,
       origin,
+      rows,
+      columns,
       direction: [...rowCosineVec, ...colCosineVec, ...scanAxisNormal],
       dimensions: [xVoxels, yVoxels, zVoxels],
       spacing: [xSpacing, ySpacing, zSpacing],
@@ -201,7 +224,7 @@ class VideoViewport extends Viewport implements IVideoViewport {
     const { rendered } = metaData.get(MetadataModules.IMAGE_URL, imageId);
     const generalSeries = metaData.get(MetadataModules.GENERAL_SERIES, imageId);
     this.modality = generalSeries?.Modality;
-    this.metadata = this._getImageDataMetadata();
+    this.metadata = this.getImageDataMetadata(imageId);
 
     return this.setVideoURL(rendered).then(() => {
       let { cineRate, numberOfFrames } = metaData.get(
@@ -220,14 +243,23 @@ class VideoViewport extends Viewport implements IVideoViewport {
       this.numberOfFrames = numberOfFrames;
       // 1 based range setting
       this.setFrameRange([1, numberOfFrames]);
-      this.play();
-      // This is ugly, but without it, the video often fails to render initially
-      // so having a play, followed by a pause fixes things.
-      // 50 ms is a tested value that seems to work to prevent exceptions
-      window.setTimeout(() => {
+      // The initial render allows us to set the frame position - rendering needs
+      // to start already playing
+      this.initialRender = () => {
+        this.initialRender = null;
         this.pause();
         this.setFrameNumber(frameNumber || 1);
-      }, 50);
+      };
+
+      // This is ugly, but without it, the video often fails to render initially
+      // so having a play, followed by a pause fixes things.
+      // 25 ms is a tested value that seems to work to prevent exceptions
+      return new Promise((resolve) => {
+        window.setTimeout(() => {
+          this.setFrameNumber(frameNumber || 1);
+          resolve(this);
+        }, 25);
+      });
     });
   }
 
@@ -254,6 +286,19 @@ class VideoViewport extends Viewport implements IVideoViewport {
         loadedMetadataEventHandler
       );
     });
+  }
+
+  /**
+   * Gets all the image ids associated with this video element.  This will
+   * have # of frames elements.
+   */
+  public getImageIds(): string[] {
+    const imageIds = new Array<string>(this.numberOfFrames);
+    const baseImageId = this.imageId.replace(/[0-9]+$/, '');
+    for (let i = 0; i < this.numberOfFrames; i++) {
+      imageIds[i] = `${baseImageId}${i + 1}`;
+    }
+    return imageIds;
   }
 
   public togglePlayPause(): boolean {
@@ -453,7 +498,10 @@ class VideoViewport extends Viewport implements IVideoViewport {
     });
   }
 
-  protected getScalarData() {
+  protected getScalarData(): CanvasScalarData {
+    if (this.scalarData?.frameNumber === this.getFrameNumber()) {
+      return this.scalarData;
+    }
     const canvas = document.createElement('canvas');
     canvas.width = this.videoWidth;
     canvas.height = this.videoHeight;
@@ -465,8 +513,10 @@ class VideoViewport extends Viewport implements IVideoViewport {
       this.videoWidth,
       this.videoHeight
     );
-    const { data: scalarData } = canvasData;
-    (scalarData as any).getRange = () => [0, 255];
+    const scalarData = canvasData.data as CanvasScalarData;
+    scalarData.getRange = () => [0, 255];
+    scalarData.frameNumber = this.getFrameNumber();
+    this.scalarData = scalarData;
     return scalarData;
   }
 
@@ -493,9 +543,9 @@ class VideoViewport extends Viewport implements IVideoViewport {
           const pixelCoord = this.canvasToIndex(canvasPoint);
           return [pixelCoord[0], pixelCoord[1], 0];
         },
-        indexToWorld: (point: Point3) => {
+        indexToWorld: (point: Point2, destPoint?: Point3) => {
           const canvasPoint = this.indexToCanvas([point[0], point[1]]);
-          return this.canvasToWorld(canvasPoint);
+          return this.canvasToWorld(canvasPoint, destPoint);
         },
       },
       hasPixelSpacing: this.hasPixelSpacing,
@@ -585,7 +635,7 @@ class VideoViewport extends Viewport implements IVideoViewport {
 
     // NOTE: the parallel scale should be done first
     // because it affects the focal point later
-    if (camera.parallelScale !== undefined) {
+    if (parallelScale) {
       this.videoCamera.parallelScale =
         this.element.clientHeight / 2 / parallelScale;
     }
@@ -610,6 +660,7 @@ class VideoViewport extends Viewport implements IVideoViewport {
       ];
     }
 
+    this.canvasContext.fillStyle = 'rgba(0,0,0,1)';
     this.canvasContext.fillRect(0, 0, this.canvas.width, this.canvas.height);
 
     if (this.isPlaying === false) {
@@ -633,15 +684,106 @@ class VideoViewport extends Viewport implements IVideoViewport {
     const current = this.imageId.replace(
       '/frames/1',
       this.isPlaying
-        ? `/frames/1-${this.numberOfFrames}`
+        ? `/frames/${this.frameRange[0]}-${this.frameRange[1]}`
         : `/frames/${this.getFrameNumber()}`
     );
     return current;
   }
 
+  /**
+   *  Gets a target id that can be used to specify how to show this
+   */
+  public getReferenceId(specifier: ViewReferenceSpecifier = {}): string {
+    const { sliceIndex: sliceIndex } = specifier;
+    if (sliceIndex === undefined) {
+      return `videoId:${this.getCurrentImageId()}`;
+    }
+    if (Array.isArray(sliceIndex)) {
+      // Just remove the 1 from the end of the base URL - TODO, handle other types
+      return `videoId:${this.imageId.substring(0, this.imageId.length - 1)}${
+        sliceIndex[0] + 1
+      }-${sliceIndex[1] + 1}`;
+    }
+    const baseTarget = this.imageId.replace(
+      '/frames/1',
+      `/frames/${1 + sliceIndex}`
+    );
+    return `videoId:${baseTarget}`;
+  }
+
+  /**
+   * Figure out if a given view can be shown in the current viewport.
+   */
+  public isReferenceViewable(
+    viewRef: ViewReference,
+    options: ReferenceCompatibleOptions = {}
+  ): boolean {
+    let { imageURI } = options;
+    const { referencedImageId, sliceIndex: sliceIndex } = viewRef;
+    if (!super.isReferenceViewable(viewRef)) {
+      return false;
+    }
+
+    const imageId = this.getCurrentImageId();
+    if (!imageURI) {
+      // Remove the dataLoader scheme and frame number
+      // TODO - handle more imageURI types.
+      const colonIndex = imageId.indexOf(':');
+      imageURI = imageId.substring(colonIndex + 1, imageId.length - 1);
+    }
+
+    if (options.withNavigation) {
+      return true;
+    }
+    const currentIndex = this.getCurrentImageIdIndex();
+    if (Array.isArray(sliceIndex)) {
+      return currentIndex >= sliceIndex[0] && currentIndex <= sliceIndex[1];
+    }
+    if (sliceIndex !== undefined) {
+      return currentIndex === sliceIndex;
+    }
+    if (!referencedImageId) {
+      return false;
+    }
+    const match = referencedImageId.match(VideoViewport.frameRangeExtractor);
+    if (!match || !match[2]) {
+      return true;
+    }
+    const range = match[2].split('-').map((it) => Number(it));
+    const frame = currentIndex + 1;
+    return range[0] <= frame && frame <= (range[1] ?? range[0]);
+  }
+
+  /**
+   * Gets a view target that species what type of view is required to show
+   * the current view, or the one specified in the forTarget modifiers.
+   */
+  public getViewReference(
+    viewRefSpecifier?: ViewReferenceSpecifier
+  ): ViewReference {
+    let sliceIndex = viewRefSpecifier?.sliceIndex;
+    if (!sliceIndex) {
+      sliceIndex = this.isPlaying
+        ? [this.frameRange[0] - 1, this.frameRange[1] - 1]
+        : this.getCurrentImageIdIndex();
+    }
+    return {
+      ...super.getViewReference(viewRefSpecifier),
+      referencedImageId: this.getReferenceId(viewRefSpecifier),
+      sliceIndex: sliceIndex,
+    };
+  }
+
+  /**
+   * Gets the 1 based frame number (ala DICOM value), eg `1+ currentImageIdIndex`
+   */
   public getFrameNumber() {
     // Need to round this as the fps/time isn't exact
-    return 1 + Math.round(this.videoElement.currentTime * this.fps);
+    return 1 + this.getCurrentImageIdIndex();
+  }
+
+  public getCurrentImageIdIndex() {
+    return Math.round(this.videoElement.currentTime * this.fps);
   }
 
   public getCamera(): ICamera {
@@ -714,7 +856,10 @@ class VideoViewport extends Viewport implements IVideoViewport {
    * @param canvasPos - to convert to world
    * @returns World position
    */
-  public canvasToWorld = (canvasPos: Point2): Point3 => {
+  public canvasToWorld = (
+    canvasPos: Point2,
+    destPos: Point3 = [0, 0, 0]
+  ): Point3 => {
     const pan: Point2 = this.videoCamera.panWorld; // In world coordinates
     const worldToCanvasRatio: number = this.getWorldToCanvasRatio();
 
@@ -728,17 +873,19 @@ class VideoViewport extends Viewport implements IVideoViewport {
       canvasPos[1] - panOffsetCanvas[1],
     ];
 
-    const worldPos: Point3 = [
-      subCanvasPos[0] / worldToCanvasRatio,
-      subCanvasPos[1] / worldToCanvasRatio,
+    // Replace the x,y values only in place in the world position
+    // as the z is unchanging for video display
+    destPos.splice(
       0,
-    ];
-
-    return worldPos;
+      2,
+      subCanvasPos[0] / worldToCanvasRatio,
+      subCanvasPos[1] / worldToCanvasRatio
+    );
+    return destPos;
   };
 
   /**
-   * Converts and [x,y] video coordinate to a Cornerstone3D VideoViewport.
+   * Converts `[x, y, 0]` world video coordinate to canvas CSS coordinates.
    *
    * @param  worldPos - world coord to convert to canvas
    * @returns Canvas position
@@ -747,47 +894,53 @@ class VideoViewport extends Viewport implements IVideoViewport {
     const pan: Point2 = this.videoCamera.panWorld;
     const worldToCanvasRatio: number = this.getWorldToCanvasRatio();
 
-    const subCanvasPos: Point2 = [
+    const canvasPos: Point2 = [
       (worldPos[0] + pan[0]) * worldToCanvasRatio,
       (worldPos[1] + pan[1]) * worldToCanvasRatio,
     ];
-
-    const canvasPos: Point2 = [subCanvasPos[0], subCanvasPos[1]];
 
     return canvasPos;
   };
 
   public getPan(): Point2 {
-    const worldPan = this.videoCamera.panWorld;
-    return [worldPan[0], worldPan[1]];
+    const panWorld = this.videoCamera.panWorld;
+    return [panWorld[0], panWorld[1]];
   }
 
   public getRotation = () => 0;
 
+  /**
+   * Uses the transform to convert canvas coordinates into index coordinates.
+   */
   protected canvasToIndex = (canvasPos: Point2): Point2 => {
     const transform = this.getTransform();
     transform.invert();
 
-    return transform.transformPoint(canvasPos);
+    return transform.transformPoint(
+      <Point2>canvasPos.map((it) => it * devicePixelRatio)
+    );
   };
 
   protected indexToCanvas = (indexPos: Point2): Point2 => {
     const transform = this.getTransform();
-    return transform.transformPoint(indexPos);
+    return <Point2>(
+      transform.transformPoint(indexPos).map((it) => it / devicePixelRatio)
+    );
   };
 
+  /**
+   * Sets  initial video camera to center the image area.  The values
+   * are set in canvas CSS pixel units and NOT in canvas index units.
+   */
   private refreshRenderValues() {
     // this means that each unit (pixel) in the world (video) would be
-    // represented by n pixels in the canvas.
-    let worldToCanvasRatio = this.canvas.width / this.videoWidth;
+    // represented by n pixels in the canvas, measured in css pixels
+    let worldToCanvasRatio = this.canvas.offsetWidth / this.videoWidth;
 
     if (this.videoHeight * worldToCanvasRatio > this.canvas.height) {
       // If by fitting the width, we exceed the height of the viewport, then we need to decrease the
       // size of the viewport further by considering its verticality.
-      const secondWorldToCanvasRatio =
-        this.canvas.height / (this.videoHeight * worldToCanvasRatio);
-
-      worldToCanvasRatio *= secondWorldToCanvasRatio;
+      worldToCanvasRatio = this.canvas.offsetHeight / this.videoHeight;
     }
 
     // Set the width as big as possible, this is the portion of the canvas
@@ -796,8 +949,8 @@ class VideoViewport extends Viewport implements IVideoViewport {
     const drawHeight = Math.floor(this.videoHeight * worldToCanvasRatio);
 
     // calculate x and y offset in order to center the image
-    const xOffsetCanvas = this.canvas.width / 2 - drawWidth / 2;
-    const yOffsetCanvas = this.canvas.height / 2 - drawHeight / 2;
+    const xOffsetCanvas = (this.canvas.offsetWidth - drawWidth) / 2;
+    const yOffsetCanvas = (this.canvas.offsetHeight - drawHeight) / 2;
 
     const xOffsetWorld = xOffsetCanvas / worldToCanvasRatio;
     const yOffsetWorld = yOffsetCanvas / worldToCanvasRatio;
@@ -818,16 +971,26 @@ class VideoViewport extends Viewport implements IVideoViewport {
     this.renderFrame();
   };
 
+  /**
+   * Creates a transform from video index coordinates to canvas coordinates.
+   */
   protected getTransform() {
     const panWorld: Point2 = this.videoCamera.panWorld;
+    const devicePixelRatio = window.devicePixelRatio || 1;
     const worldToCanvasRatio: number = this.getWorldToCanvasRatio();
     const canvasToWorldRatio: number = this.getCanvasToWorldRatio();
-    const halfCanvas = [this.canvas.width / 2, this.canvas.height / 2];
+    const halfCanvas = [
+      this.canvas.offsetWidth / 2,
+      this.canvas.offsetHeight / 2,
+    ];
     const halfCanvasWorldCoordinates = [
       halfCanvas[0] * canvasToWorldRatio,
       halfCanvas[1] * canvasToWorldRatio,
     ];
     const transform = new Transform();
+
+    // Start by converting into canvas index coordinates FROM canvas css pixel coordinates
+    transform.scale(devicePixelRatio, devicePixelRatio);
 
     // Translate to the center of the canvas (move origin of the transform
     // to the center of the canvas)
@@ -846,11 +1009,47 @@ class VideoViewport extends Viewport implements IVideoViewport {
     );
     return transform;
   }
+
+  /**
+   * Nothing to do for the clipping planes for video as they don't exist.
+   */
+  public updateCameraClippingPlanesAndRange() {
+    // No-op
+  }
+
+  public addImages(stackInputs: Array<any>) {
+    const actors = this.getActors();
+    stackInputs.forEach((stackInput) => {
+      const image = cache.getImage(stackInput.imageId);
+
+      const imageActor = this.createActorMapper(image);
+      if (imageActor) {
+        actors.push({ uid: stackInput.actorUID, actor: imageActor });
+        if (stackInput.callback) {
+          stackInput.callback({ imageActor, imageId: stackInput.imageId });
+        }
+      }
+    });
+    this.setActors(actors);
+  }
+
+  protected createActorMapper(image) {
+    return new CanvasActor(this, image);
+  }
+
+  /**
+   * Renders the video frame to the viewport.
+   */
   private renderFrame = () => {
     const transform = this.getTransform();
     const transformationMatrix: number[] = transform.getMatrix();
 
-    this.canvasContext.transform(
+    const ctx = this.canvasContext;
+
+    ctx.resetTransform();
+
+    // Need to correct the transform for device pixel ratio scaling.
+    ctx.transform(
       transformationMatrix[0],
       transformationMatrix[1],
       transformationMatrix[2],
@@ -859,16 +1058,22 @@ class VideoViewport extends Viewport implements IVideoViewport {
       transformationMatrix[5]
     );
 
-    this.canvasContext.drawImage(
-      this.videoElement,
-      0,
-      0,
-      this.videoWidth,
-      this.videoHeight
-    );
+    ctx.drawImage(this.videoElement, 0, 0, this.videoWidth, this.videoHeight);
 
+    for (const actor of this.getActors()) {
+      (actor.actor as ICanvasActor).render(this, this.canvasContext);
+    }
     this.canvasContext.resetTransform();
 
+    // This is stack new image to agree with stack/non-volume viewports
+    triggerEvent(this.element, EVENTS.STACK_NEW_IMAGE, {
+      element: this.element,
+      viewportId: this.id,
+      viewport: this,
+      renderingEngineId: this.renderingEngineId,
+      time: this.videoElement.currentTime,
+      duration: this.videoElement.duration,
+    });
     triggerEvent(this.element, EVENTS.IMAGE_RENDERED, {
       element: this.element,
       viewportId: this.id,
@@ -877,6 +1082,8 @@ class VideoViewport extends Viewport implements IVideoViewport {
       time: this.videoElement.currentTime,
       duration: this.videoElement.duration,
     });
+
+    this.initialRender?.();
 
     const frame = this.getFrameNumber();
     if (this.isPlaying) {
