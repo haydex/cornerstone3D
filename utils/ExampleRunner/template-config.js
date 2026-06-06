@@ -113,6 +113,9 @@ module.exports = {
       '127.0.0.1',
       'localhost',
     ],
+    static: [
+      { directory: '/Users/hayderphd/Downloads/nifti', publicPath: '/nifti-local' },
+    ],
   },
 };
 `;

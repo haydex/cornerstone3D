@@ -28,7 +28,7 @@ type NiftiDataFetchState =
 
 const dataFetchStateMap: Map<string, NiftiDataFetchState> = new Map();
 
-function fetchArrayBuffer({
+async function fetchArrayBuffer({
   url,
   signal,
   onload,
@@ -37,31 +37,26 @@ function fetchArrayBuffer({
   signal?: AbortSignal;
   onload?: () => void;
 }): Promise<ArrayBuffer> {
-  return new Promise(async (resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('GET', url, true);
+  const xhr = new XMLHttpRequest();
+  xhr.open('GET', url, true);
 
-    const defaultHeaders = {} as Record<string, string>;
-    const options = getOptions();
+  const defaultHeaders = {} as Record<string, string>;
+  const options = getOptions();
 
-    const beforeSendHeaders = await options.beforeSend(
-      xhr,
-      defaultHeaders,
-      url
-    );
+  const beforeSendHeaders = await options.beforeSend(xhr, defaultHeaders, url);
+  const headers = Object.assign({}, defaultHeaders, beforeSendHeaders);
 
-    const headers = Object.assign({}, defaultHeaders, beforeSendHeaders);
+  xhr.responseType = 'arraybuffer';
 
-    xhr.responseType = 'arraybuffer';
+  Object.keys(headers).forEach(function (key) {
+    if (headers[key] === null) {
+      return;
+    }
+    xhr.setRequestHeader(key, headers[key]);
+  });
 
-    Object.keys(headers).forEach(function (key) {
-      if (headers[key] === null) {
-        return;
-      }
-      xhr.setRequestHeader(key, headers[key]);
-    });
-
-    const onLoadHandler = function (e) {
+  return new Promise((resolve, reject) => {
+    const onLoadHandler = function (_e: Event) {
       if (onload && typeof onload === 'function') {
         onload();
       }
@@ -85,7 +80,7 @@ function fetchArrayBuffer({
 
     xhr.addEventListener('load', onLoadHandler);
 
-    const onProgress = (loaded, total) => {
+    const onProgress = (loaded: number, total: number) => {
       const data = { url, loaded, total };
       triggerEvent(eventTarget, Events.NIFTI_VOLUME_PROGRESS, { data });
     };
@@ -234,12 +229,48 @@ function createImage(
 ) {
   const { rows, columns } = imagePlaneModule;
   const numVoxels = rows * columns;
-  const sliceOffset = numVoxels * sliceIndex;
 
   const pixelData = new (niftiScalarData.constructor as {
     new (size: number): Types.PixelDataTypedArray;
   })(numVoxels);
-  pixelData.set(niftiScalarData.subarray(sliceOffset, sliceOffset + numVoxels));
+
+  const niftiHeaderMeta = metaData.get('niftiHeader', imageId) as {
+    sliceDimIndex?: number;
+    header?: { dims: number[] };
+  };
+  const sliceDimIndex: number = niftiHeaderMeta?.sliceDimIndex ?? 2;
+  const niftiHdr = niftiHeaderMeta?.header;
+
+  if (sliceDimIndex === 2 || !niftiHdr) {
+    // k-slice (default): all voxels for one k-plane are contiguous in memory
+    const sliceOffset = numVoxels * sliceIndex;
+    pixelData.set(
+      niftiScalarData.subarray(sliceOffset, sliceOffset + numVoxels)
+    );
+  } else if (sliceDimIndex === 1) {
+    // j-slice: pixel(row=k, col=i) = voxel(i, j=sliceIndex, k)
+    // NIfTI index: i + j*dimI + k*dimI*dimJ — for fixed k the i-values are contiguous
+    const dimI = niftiHdr.dims[1];
+    const dimJ = niftiHdr.dims[2];
+    for (let k = 0; k < rows; k++) {
+      const srcOffset = sliceIndex * dimI + k * dimI * dimJ;
+      pixelData.set(
+        niftiScalarData.subarray(srcOffset, srcOffset + dimI),
+        k * dimI
+      );
+    }
+  } else {
+    // i-slice: pixel(row=k, col=j) = voxel(i=sliceIndex, j, k)
+    // NIfTI index: sliceIndex + j*dimI + k*dimI*dimJ — strided, requires per-voxel copy
+    const dimI = niftiHdr.dims[1];
+    const dimJ = niftiHdr.dims[2];
+    for (let k = 0; k < rows; k++) {
+      for (let j = 0; j < columns; j++) {
+        pixelData[k * columns + j] =
+          niftiScalarData[sliceIndex + j * dimI + k * dimI * dimJ];
+      }
+    }
+  }
 
   // @ts-ignore
   const voxelManager = utilities.VoxelManager.createImageVoxelManager({

@@ -127,7 +127,7 @@ addDropdownToToolbar({
 });
 
 const niftiURL =
-  'https://ohif-assets.s3.us-east-2.amazonaws.com/nifti/CTACardio.nii.gz';
+  'http://localhost:3000/nifti-local/Yale-Glioma-Preoperative-0094-T2w_coronal.nii';
 const volumeLoaderScheme = 'cornerstoneStreamingImageVolume'; // Loader id which defines which volume loader to use
 const volumeId = `${volumeLoaderScheme}:${niftiURL}`; // VolumeId with loader id + volume id
 

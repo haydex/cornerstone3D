@@ -3,7 +3,7 @@ import { eventTarget, triggerEvent, utilities } from '@cornerstonejs/core';
 import type { mat3 } from 'gl-matrix';
 import { rasToLps } from './helpers/convert';
 import Events from './enums/Events';
-import { NIFTI_LOADER_SCHEME } from './constants';
+
 import makeVolumeMetadata from './helpers/makeVolumeMetadata';
 import { getArrayConstructor } from './helpers/dataTypeCodeHelper';
 import { getOptions } from './internal';
@@ -179,6 +179,7 @@ function handleNiftiHeader(data): {
   spacing: number[];
   header: unknown;
   arrayConstructor: unknown;
+  sliceDimIndex: number;
 } {
   if (data.length < HEADER_CHECK_SIZE) {
     // @ts-ignore
@@ -198,6 +199,16 @@ function handleNiftiHeader(data): {
       1 // pixelRepresentation
     );
 
+    // Detect which voxel axis is the through-plane (slice) direction.
+    // The axis with the largest spacing is the slice direction (thick slabs).
+    // Default to k (index 2) if all spacings are similar.
+    let sliceDimIndex = 2;
+    if (spacing[1] > spacing[0] && spacing[1] > spacing[2]) {
+      sliceDimIndex = 1;
+    } else if (spacing[0] > spacing[1] && spacing[0] > spacing[2]) {
+      sliceDimIndex = 0;
+    }
+
     const arrayConstructor = getArrayConstructor(header.datatypeCode);
 
     return {
@@ -211,6 +222,7 @@ function handleNiftiHeader(data): {
       spacing,
       header,
       arrayConstructor,
+      sliceDimIndex,
     };
   } catch (error) {
     console.error('Error reading Nifti header:', error);
@@ -255,6 +267,7 @@ async function fetchAndAllocateNiftiVolume(url) {
     spacing: number[];
     header: unknown;
     arrayConstructor: unknown;
+    sliceDimIndex: number;
   };
 
   const {
@@ -267,14 +280,49 @@ async function fetchAndAllocateNiftiVolume(url) {
     header,
     spacing,
     arrayConstructor,
+    sliceDimIndex,
   } = niftiHeader;
-
-  const numImages = dimensions[2];
 
   if (!isValid) {
     console.error(message);
     return;
   }
+
+  // dimensions = [i-size, j-size, k-size] (maps to dims[1], dims[2], dims[3])
+  // direction[0..2]=LPS i-dir, direction[3..5]=LPS j-dir, direction[6..8]=LPS k-dir
+  // spacing[0..2] = voxel spacing along i, j, k
+  //
+  // sliceDimIndex: which voxel axis (0=i,1=j,2=k) is the through-plane direction.
+  // The two remaining axes form the in-plane image.
+  // rowAxisIdx   → direction of increasing column index (left-right in image)
+  // colAxisIdx   → direction of increasing row index (top-bottom in image)
+  let rowAxisIdx: number, colAxisIdx: number;
+  if (sliceDimIndex === 0) {
+    rowAxisIdx = 1;
+    colAxisIdx = 2;
+  } else if (sliceDimIndex === 1) {
+    rowAxisIdx = 0;
+    colAxisIdx = 2;
+  } else {
+    rowAxisIdx = 0;
+    colAxisIdx = 1; // default: k is slice
+  }
+
+  const dirVec = [
+    Array.from(direction.slice(0, 3)),
+    Array.from(direction.slice(3, 6)),
+    Array.from(direction.slice(6, 9)),
+  ];
+
+  const numImages = dimensions[sliceDimIndex];
+  const imageCols = dimensions[rowAxisIdx];
+  const imageRows = dimensions[colAxisIdx];
+  const sliceSpacing = spacing[sliceDimIndex];
+  const colSpacing = spacing[rowAxisIdx]; // distance between adjacent columns
+  const rowSpacing = spacing[colAxisIdx]; // distance between adjacent rows
+  const rowCosinesVec = dirVec[rowAxisIdx];
+  const colCosinesVec = dirVec[colAxisIdx];
+  const scanAxisVec = dirVec[sliceDimIndex];
 
   const imageIds = [];
   for (let i = 0; i < numImages; i++) {
@@ -282,29 +330,22 @@ async function fetchAndAllocateNiftiVolume(url) {
     const imageIdIndex = i;
     imageIds.push(imageId);
 
-    const imageOrientationPatient = [
-      direction[0],
-      direction[1],
-      direction[2],
-      direction[3],
-      direction[4],
-      direction[5],
-    ];
+    const imageOrientationPatient = [...rowCosinesVec, ...colCosinesVec];
 
     const precision = 6;
     const imagePositionPatient = [
       parseFloat(
-        (origin[0] + imageIdIndex * direction[6] * spacing[0]).toFixed(
+        (origin[0] + imageIdIndex * scanAxisVec[0] * sliceSpacing).toFixed(
           precision
         )
       ),
       parseFloat(
-        (origin[1] + imageIdIndex * direction[7] * spacing[1]).toFixed(
+        (origin[1] + imageIdIndex * scanAxisVec[1] * sliceSpacing).toFixed(
           precision
         )
       ),
       parseFloat(
-        (origin[2] + imageIdIndex * direction[8] * spacing[2]).toFixed(
+        (origin[2] + imageIdIndex * scanAxisVec[2] * sliceSpacing).toFixed(
           precision
         )
       ),
@@ -312,24 +353,24 @@ async function fetchAndAllocateNiftiVolume(url) {
     // Create metadata for the image
     const imagePlaneMetadata = {
       frameOfReferenceUID: '1.2.840.10008.1.4',
-      rows: dimensions[1],
-      columns: dimensions[0],
+      rows: imageRows,
+      columns: imageCols,
       imageOrientationPatient,
-      rowCosines: direction.slice(0, 3),
-      columnCosines: direction.slice(3, 6),
+      rowCosines: rowCosinesVec,
+      columnCosines: colCosinesVec,
       imagePositionPatient,
-      sliceThickness: spacing[2],
-      sliceLocation: origin[2] + i * spacing[2],
-      pixelSpacing: [spacing[0], spacing[1]],
-      rowPixelSpacing: spacing[1],
-      columnPixelSpacing: spacing[0],
+      sliceThickness: sliceSpacing,
+      sliceLocation: imageIdIndex * sliceSpacing,
+      pixelSpacing: [rowSpacing, colSpacing],
+      rowPixelSpacing: rowSpacing,
+      columnPixelSpacing: colSpacing,
     };
 
     const imagePixelMetadata = {
       samplesPerPixel: 1,
       photometricInterpretation: 'MONOCHROME2',
-      rows: dimensions[1],
-      columns: dimensions[0],
+      rows: imageRows,
+      columns: imageCols,
       // @ts-expect-error
       bitsAllocated: arrayConstructor.BYTES_PER_ELEMENT * 8,
       // @ts-expect-error
@@ -385,6 +426,7 @@ async function fetchAndAllocateNiftiVolume(url) {
       type: 'niftiHeader',
       metadata: {
         header,
+        sliceDimIndex,
       },
     });
   }

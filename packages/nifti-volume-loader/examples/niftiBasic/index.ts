@@ -37,7 +37,7 @@ content.appendChild(viewportGrid);
 const viewportId1 = 'CT_NIFTI_AXIAL';
 
 const niftiURL =
-  'https://ohif-assets.s3.us-east-2.amazonaws.com/nifti/CTACardio.nii.gz';
+  'http://localhost:3000/nifti-local/Yale-Glioma-Preoperative-0017-coronal.nii';
 
 async function setup() {
   await initDemo();
